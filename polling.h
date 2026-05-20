@@ -17,6 +17,7 @@
 extern volatile bool g_ota_in_progress;
 
 // ════════════════════════════════════════════════════════════
+
 // POLLING FUNCTIONS
 // ════════════════════════════════════════════════════════════
 void PollingTask(void* pv);
