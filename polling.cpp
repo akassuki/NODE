@@ -95,17 +95,31 @@ static bool wait_ack(uint8_t expected_idx) {
                 continue;
             }
             uint8_t* p = (uint8_t*)rsc.data;
-            // p[0]=CMD_ACK, p[1]=GW_ADDH, p[2]=GW_ADDL, p[3]=frag_idx
             Serial.printf("[0x%02X] ACK bytes: %02X %02X %02X %02X\n",
                           NODE_ADDL, p[0], p[1], p[2], p[3]);
 
-            if (p[0] != CMD_ACK)                     { rsc.close(); continue; }
-            if (p[1] != GW_ADDH || p[2] != GW_ADDL)  { rsc.close(); continue; }
+            if (p[0] != CMD_ACK)                    { rsc.close(); continue; }
+            if (p[1] != GW_ADDH || p[2] != GW_ADDL) { rsc.close(); continue; }
+
             if (p[3] == expected_idx) {
+                // ACK đúng fragment
                 Serial.printf("[0x%02X] ACK(%d) OK\n", NODE_ADDL, expected_idx);
                 rsc.close();
                 return true;
             }
+
+            if (p[3] < expected_idx) {
+                // ACK cũ từ retry của gateway — reset timer, tiếp tục chờ
+                Serial.printf("[0x%02X] ACK(%d) cũ, đang chờ ACK(%d) — reset timer\n",
+                              NODE_ADDL, p[3], expected_idx);
+                rsc.close();
+                start = millis();  // ← reset timer, không tính là timeout
+                continue;
+            }
+
+            // p[3] > expected_idx: bất thường
+            Serial.printf("[0x%02X] ACK(%d) > expected(%d), bỏ qua\n",
+                          NODE_ADDL, p[3], expected_idx);
             rsc.close();
         }
         vTaskDelay(pdMS_TO_TICKS(POLL_WAIT_MS));
@@ -184,22 +198,16 @@ void PollingTask(void* pv) {
     Serial.printf("[PollingTask] Bắt đầu, chờ POLL...\n");
 
     while (true) {
-
-        // ── Đang OTA → nhường CPU, không poll ────────────────
         if (g_ota_in_progress) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
 
-        // ── Chờ tối thiểu POLL_FRAME_LEN bytes (4) ───────────
-        // Không chờ OTA_FRAME_LEN (7) vì POLL chỉ có 4 bytes
-        // → đọc 4 trước, nếu là CMD_OTA thì đọc thêm 3
         if (e32.available() < POLL_FRAME_LEN) {
             vTaskDelay(pdMS_TO_TICKS(POLL_WAIT_MS));
             continue;
         }
 
-        // ── Đọc 4 bytes đầu ──────────────────────────────────
         ResponseStructContainer rsc = e32.receiveMessage(POLL_FRAME_LEN);
         if (rsc.status.code != SUCCESS) { rsc.close(); continue; }
 
@@ -209,12 +217,17 @@ void PollingTask(void* pv) {
         Serial.printf("[0x%02X] RX cmd=0x%02X: %02X %02X %02X %02X\n",
                       NODE_ADDL, cmd, p[0], p[1], p[2], p[3]);
 
-        // ── CMD_POLL ──────────────────────────────────────────
-        // Frame: [CMD_POLL][GW_ADDH][GW_ADDL][XOR3] = 4 bytes, đủ rồi
+        // ── Bỏ qua ACK cũ còn sót sau khi gửi xong fragment cuối ──
+        if (cmd == CMD_ACK) {
+            Serial.printf("[0x%02X] ACK cũ (idx=%d) còn sót — flush\n",
+                          NODE_ADDL, p[3]);
+            rsc.close();
+            continue;
+        }
+
         if (cmd == CMD_POLL) {
             if (p[1] != GW_ADDH || p[2] != GW_ADDL || xor_chk(p, 3) != p[3]) {
-                Serial.printf("[0x%02X] POLL frame lỗi: addr=%02X:%02X xor_got=%02X xor_exp=%02X\n",
-                              NODE_ADDL, p[1], p[2], p[3], xor_chk(p, 3));
+                Serial.printf("[0x%02X] POLL frame lỗi\n", NODE_ADDL);
                 rsc.close();
                 continue;
             }
@@ -223,37 +236,27 @@ void PollingTask(void* pv) {
             Serial.printf("[0x%02X] POLL hợp lệ\n", NODE_ADDL);
             int test_case = random(0, 3);
             const char* cases[] = {"SMALL(4)", "MEDIUM(24)", "LARGE(30)"};
-            Serial.printf("[0x%02X] Case = %d (%s)\n", NODE_ADDL, test_case, cases[test_case]);
+            Serial.printf("[0x%02X] Case = %d (%s)\n",
+                          NODE_ADDL, test_case, cases[test_case]);
             send_data(test_case);
         }
 
-        // ── CMD_OTA ───────────────────────────────────────────
-        // E32 đã bóc 3 bytes prefix [DST_ADDH][DST_ADDL][CH]
-        // → node chỉ nhận 4 bytes: [CMD_OTA][NODE_ADDH][NODE_ADDL][CH]
-        // (không có OTA_ADDH/OTA_ADDL/XOR vì master không gửi thêm)
         else if (cmd == CMD_OTA) {
             if (p[1] != NODE_ADDH || p[2] != NODE_ADDL) {
-                Serial.printf("[0x%02X] CMD_OTA không phải cho node này: %02X:%02X\n",
-                              NODE_ADDL, p[1], p[2]);
+                Serial.printf("[0x%02X] CMD_OTA không phải cho node này\n", NODE_ADDL);
                 rsc.close();
                 continue;
             }
             rsc.close();
 
-            Serial.printf("[0x%02X] CMD_OTA hợp lệ — CH=%d, bắt đầu OTA\n",
-                          NODE_ADDL, p[3]);
-
-            // Set flag TRƯỚC khi tạo task để tránh race condition
+            Serial.printf("[0x%02X] CMD_OTA hợp lệ — bắt đầu OTA\n", NODE_ADDL);
             g_ota_in_progress = true;
             start_ota_tasks();
-
-            // KHÔNG vTaskSuspend — PollingTask tự skip qua flag ở đầu loop
-            Serial.printf("[0x%02X] OTA bắt đầu, tạm dừng polling đến khi xong\n", NODE_ADDL);
         }
 
-        // ── Frame lạ ─────────────────────────────────────────
         else {
-            Serial.printf("[0x%02X] Frame lạ cmd=0x%02X, bỏ qua\n", NODE_ADDL, cmd);
+            Serial.printf("[0x%02X] Frame lạ cmd=0x%02X, bỏ qua\n",
+                          NODE_ADDL, cmd);
             rsc.close();
         }
     }

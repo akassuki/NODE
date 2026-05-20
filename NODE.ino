@@ -4,18 +4,10 @@
  * Entry point: setup() + loop()
  * Định nghĩa các biến global dùng chung (extern trong lora_config.h)
  *
- * Cấu trúc file:
- *   lora_config.h   — defines, structs, extern declarations
- *   update_ota.h/cpp — ring buffer, delta OTA, LoRaRxTask, ProcessTask
- *   polling.h/cpp    — PollingTask, send_data, wait_ack, build_json
- *   main.ino         — setup(), loop(), định nghĩa global
  */
 
 #include "polling.h"  
 
-// ════════════════════════════════════════════════════════════
-// ĐỊNH NGHĨA GLOBAL — extern khai báo trong lora_config.h
-// ════════════════════════════════════════════════════════════
 HardwareSerial loraSerial(1);
 LoRa_E32       e32(LORA_TX_PIN, LORA_RX_PIN, &loraSerial, UART_BPS_RATE_9600);
 
@@ -61,6 +53,7 @@ void setup() {
     );
 
     Serial.printf("[Node 0x%02X] Sẵn sàng\n", NODE_ADDL);
+    //Serial.printf("[Node 0x%02X] VIETTIEN\n", NODE_ADDL);
 }
 
 // ════════════════════════════════════════════════════════════
