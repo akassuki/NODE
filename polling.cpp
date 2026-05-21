@@ -83,9 +83,58 @@ static int build_json(int test_case, char* buf, size_t buf_size) {
 // E32 fixed transmission tự bóc 3 bytes prefix [DST_ADDH][DST_ADDL][CH]
 // → node nhận đúng body: [CMD_ACK][GW_ADDH][GW_ADDL][frag_idx] = 4 bytes
 // ════════════════════════════════════════════════════════════
-static bool wait_ack(uint8_t expected_idx) {
+// static bool wait_ack(uint8_t expected_idx) {
+//     vTaskDelay(pdMS_TO_TICKS(30));
+//     uint32_t start = millis();
+//     while (millis() - start < ACK_TIMEOUT_MS) {
+//         if (e32.available() >= ACK_FRAME_LEN) {
+//             ResponseStructContainer rsc = e32.receiveMessage(ACK_FRAME_LEN);
+//             if (rsc.status.code != SUCCESS) {
+//                 rsc.close();
+//                 vTaskDelay(pdMS_TO_TICKS(POLL_WAIT_MS));
+//                 continue;
+//             }
+//             uint8_t* p = (uint8_t*)rsc.data;
+//             Serial.printf("[0x%02X] ACK bytes: %02X %02X %02X %02X\n",
+//                           NODE_ADDL, p[0], p[1], p[2], p[3]);
+
+//             if (p[0] != CMD_ACK)                    { rsc.close(); continue; }
+//             if (p[1] != GW_ADDH || p[2] != GW_ADDL) { rsc.close(); continue; }
+
+//             if (p[3] == expected_idx) {
+//                 // ACK đúng fragment
+//                 Serial.printf("[0x%02X] ACK(%d) OK\n", NODE_ADDL, expected_idx);
+//                 rsc.close();
+//                 return true;
+//             }
+
+//             if (p[3] < expected_idx) {
+//                 // ACK cũ từ retry của gateway — reset timer, tiếp tục chờ
+//                 Serial.printf("[0x%02X] ACK(%d) cũ, đang chờ ACK(%d) — reset timer\n",
+//                               NODE_ADDL, p[3], expected_idx);
+//                 rsc.close();
+//                 start = millis();  // ← reset timer, không tính là timeout
+//                 continue;
+//             }
+
+//             // p[3] > expected_idx: bất thường
+//             Serial.printf("[0x%02X] ACK(%d) > expected(%d), bỏ qua\n",
+//                           NODE_ADDL, p[3], expected_idx);
+//             rsc.close();
+//         }
+//         vTaskDelay(pdMS_TO_TICKS(POLL_WAIT_MS));
+//     }
+//     Serial.printf("[0x%02X] ACK(%d) timeout!\n", NODE_ADDL, expected_idx);
+//     return false;
+// }
+
+/* Trả về true=ACK OK, false=timeout hoặc nhận POLL
+ * got_poll=true nếu nhận được POLL mới từ gateway */
+static bool wait_ack_or_poll(uint8_t expected_idx, bool* got_poll) {
+    *got_poll = false;
     vTaskDelay(pdMS_TO_TICKS(30));
     uint32_t start = millis();
+
     while (millis() - start < ACK_TIMEOUT_MS) {
         if (e32.available() >= ACK_FRAME_LEN) {
             ResponseStructContainer rsc = e32.receiveMessage(ACK_FRAME_LEN);
@@ -95,54 +144,111 @@ static bool wait_ack(uint8_t expected_idx) {
                 continue;
             }
             uint8_t* p = (uint8_t*)rsc.data;
-            Serial.printf("[0x%02X] ACK bytes: %02X %02X %02X %02X\n",
+            Serial.printf("[0x%02X] RX: %02X %02X %02X %02X\n",
                           NODE_ADDL, p[0], p[1], p[2], p[3]);
 
-            if (p[0] != CMD_ACK)                    { rsc.close(); continue; }
-            if (p[1] != GW_ADDH || p[2] != GW_ADDL) { rsc.close(); continue; }
+            /* Nhận POLL mới → gateway đã Re-POLL */
+            if (p[0] == CMD_POLL &&
+                p[1] == GW_ADDH && p[2] == GW_ADDL &&
+                xor_chk(p, 3) == p[3]) {
+                Serial.printf("[0x%02X] Nhận CMD_POLL mới trong lúc chờ ACK(%d)\n",
+                              NODE_ADDL, expected_idx);
+                rsc.close();
+                *got_poll = true;
+                return false;
+            }
 
-            if (p[3] == expected_idx) {
-                // ACK đúng fragment
+            /* ACK đúng */
+            if (p[0] == CMD_ACK &&
+                p[1] == GW_ADDH && p[2] == GW_ADDL &&
+                p[3] == expected_idx) {
                 Serial.printf("[0x%02X] ACK(%d) OK\n", NODE_ADDL, expected_idx);
                 rsc.close();
                 return true;
             }
 
-            if (p[3] < expected_idx) {
-                // ACK cũ từ retry của gateway — reset timer, tiếp tục chờ
-                Serial.printf("[0x%02X] ACK(%d) cũ, đang chờ ACK(%d) — reset timer\n",
+            /* ACK cũ → reset timer */
+            if (p[0] == CMD_ACK && p[3] < expected_idx) {
+                Serial.printf("[0x%02X] ACK(%d) cũ, chờ ACK(%d) — reset timer\n",
                               NODE_ADDL, p[3], expected_idx);
                 rsc.close();
-                start = millis();  // ← reset timer, không tính là timeout
+                start = millis();
                 continue;
             }
 
-            // p[3] > expected_idx: bất thường
-            Serial.printf("[0x%02X] ACK(%d) > expected(%d), bỏ qua\n",
-                          NODE_ADDL, p[3], expected_idx);
             rsc.close();
         }
         vTaskDelay(pdMS_TO_TICKS(POLL_WAIT_MS));
     }
-    Serial.printf("[0x%02X] ACK(%d) timeout!\n", NODE_ADDL, expected_idx);
+
+    Serial.printf("[0x%02X] ACK(%d) timeout\n", NODE_ADDL, expected_idx);
     return false;
 }
 
 // ════════════════════════════════════════════════════════════
 // GỬI DATA FRAGMENTS
 // ════════════════════════════════════════════════════════════
+// static void send_data(int test_case) {
+//     static char json[512];
+//     int jlen = build_json(test_case, json, sizeof(json));
+//     if (jlen <= 0 || jlen >= (int)sizeof(json)) {
+//         Serial.println("[ERR] JSON lỗi");
+//         return;
+//     }
+
+//     const char* cases[] = {"SMALL(4)", "MEDIUM(24)", "LARGE(30)"};
+//     uint8_t frag_total = (jlen + FRAG_PAYLOAD_MAX - 1) / FRAG_PAYLOAD_MAX;
+//     Serial.printf("[0x%02X] Case=%s  JSON=%dB  frags=%d\n",
+//                   NODE_ADDL, cases[test_case], jlen, frag_total);
+
+//     for (uint8_t idx = 0; idx < frag_total; idx++) {
+//         uint16_t offset  = idx * FRAG_PAYLOAD_MAX;
+//         uint8_t  pay_len = (uint8_t)min((int)FRAG_PAYLOAD_MAX, jlen - (int)offset);
+
+//         uint8_t frame[55];
+//         frame[0] = CMD_DATA;
+//         frame[1] = NODE_ADDH;
+//         frame[2] = NODE_ADDL;
+//         frame[3] = idx;
+//         frame[4] = frag_total;
+//         frame[5] = pay_len;
+//         memcpy(&frame[6], json + offset, pay_len);
+//         uint8_t frame_len = 6 + pay_len;
+
+//         bool ack_ok = false;
+//         for (uint8_t tx_try = 0; tx_try < FRAG_TX_RETRY; tx_try++) {
+//             ResponseStatus rs = e32.sendFixedMessage(
+//                 GW_ADDH, GW_ADDL, LORA_CH, frame, frame_len);
+//             if (rs.code != SUCCESS) {
+//                 Serial.printf("[0x%02X] TX frag %d FAIL code=%d\n",
+//                               NODE_ADDL, idx, rs.code);
+//                 break;
+//             }
+//             Serial.printf("[0x%02X] TX frag %d/%d  len=%d  try=%d\n",
+//                           NODE_ADDL, idx, frag_total-1, pay_len, tx_try+1);
+
+//             if (idx == frag_total - 1) { ack_ok = true; break; }
+//             if (wait_ack(idx))         { ack_ok = true; break; }
+
+//             Serial.printf("[0x%02X] Retry frag %d (lần %d/%d)\n",
+//                           NODE_ADDL, idx, tx_try+1, FRAG_TX_RETRY);
+//         }
+
+//         if (!ack_ok) {
+//             Serial.printf("[0x%02X] Huỷ tại frag %d sau %d lần thử\n",
+//                           NODE_ADDL, idx, FRAG_TX_RETRY);
+//             return;
+//         }
+//     }
+//     Serial.printf("[0x%02X] Gửi xong\n", NODE_ADDL);
+// }
+
 static void send_data(int test_case) {
     static char json[512];
     int jlen = build_json(test_case, json, sizeof(json));
-    if (jlen <= 0 || jlen >= (int)sizeof(json)) {
-        Serial.println("[ERR] JSON lỗi");
-        return;
-    }
+    if (jlen <= 0 || jlen >= (int)sizeof(json)) return;
 
-    const char* cases[] = {"SMALL(4)", "MEDIUM(24)", "LARGE(30)"};
     uint8_t frag_total = (jlen + FRAG_PAYLOAD_MAX - 1) / FRAG_PAYLOAD_MAX;
-    Serial.printf("[0x%02X] Case=%s  JSON=%dB  frags=%d\n",
-                  NODE_ADDL, cases[test_case], jlen, frag_total);
 
     for (uint8_t idx = 0; idx < frag_total; idx++) {
         uint16_t offset  = idx * FRAG_PAYLOAD_MAX;
@@ -162,24 +268,35 @@ static void send_data(int test_case) {
         for (uint8_t tx_try = 0; tx_try < FRAG_TX_RETRY; tx_try++) {
             ResponseStatus rs = e32.sendFixedMessage(
                 GW_ADDH, GW_ADDL, LORA_CH, frame, frame_len);
-            if (rs.code != SUCCESS) {
-                Serial.printf("[0x%02X] TX frag %d FAIL code=%d\n",
-                              NODE_ADDL, idx, rs.code);
-                break;
-            }
+            if (rs.code != SUCCESS) break;
+
             Serial.printf("[0x%02X] TX frag %d/%d  len=%d  try=%d\n",
                           NODE_ADDL, idx, frag_total-1, pay_len, tx_try+1);
 
+            /* Fragment cuối không cần ACK */
             if (idx == frag_total - 1) { ack_ok = true; break; }
-            if (wait_ack(idx))         { ack_ok = true; break; }
+
+            /* Chờ ACK — nếu nhận POLL mới thì abort, gửi lại từ đầu */
+            bool got_poll = false;
+            if (wait_ack_or_poll(idx, &got_poll)) {
+                ack_ok = true;
+                break;
+            }
+            if (got_poll) {
+                /* Gateway Re-POLL → abort lần gửi này, 
+                 * trả về để PollingTask xử lý POLL mới */
+                Serial.printf("[0x%02X] Nhận POLL mới giữa chừng — abort, gửi lại từ đầu\n",
+                              NODE_ADDL);
+                send_data(test_case);  /* gọi đệ quy gửi lại */
+                return;
+            }
 
             Serial.printf("[0x%02X] Retry frag %d (lần %d/%d)\n",
                           NODE_ADDL, idx, tx_try+1, FRAG_TX_RETRY);
         }
 
         if (!ack_ok) {
-            Serial.printf("[0x%02X] Huỷ tại frag %d sau %d lần thử\n",
-                          NODE_ADDL, idx, FRAG_TX_RETRY);
+            Serial.printf("[0x%02X] Huỷ tại frag %d\n", NODE_ADDL, idx);
             return;
         }
     }

@@ -10,7 +10,7 @@
 // ĐỊA CHỈ NODE  ← ĐỔI cho từng node trước khi flash
 // ════════════════════════════════════════════════════════════
 #define NODE_ADDH     0x00
-#define NODE_ADDL     0x03    
+#define NODE_ADDL     0x02    
 
 #define GW_ADDH       0x00
 #define GW_ADDL       0x00
